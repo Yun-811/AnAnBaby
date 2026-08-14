@@ -196,7 +196,7 @@
         // ==========================================
         // 填入你新的 Google Apps Script URL
         // ==========================================
-        const GOOGLE_APP_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwd5geYS4oT0PKXJ2yTCdrCDyldwG_O9Gu6zybC4W2UXr9FxvL_RcV1h9IJQ3_rdUVNbQ/exec'; // ★ 請務必填入最新的部署網址
+        const GOOGLE_APP_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyPOfmDc0BmrU3y5mOCgohiiz2do_x2TbalP9XHDbtpBPIFXz1ZfhaV_aRoQWP2M9pKfw/exec'; // ★ 請務必填入最新的部署網址
         
         // 為了減少結構複雜度，sys 負責管主角等全域設定，cards 專管分類
         const defaultData = {
@@ -454,6 +454,10 @@
             showLoader("新增分類中...");
             await saveData();
             document.getElementById('new-category-name').value = '';
+            
+            // 重新渲染分類下拉選單
+            applyDataToGame(); 
+            
             hideLoader();
             showModal("分類新增成功！");
         }
@@ -486,13 +490,15 @@
                 throw new Error(json.message);
             } catch(e) {
                 console.error("上傳失敗", e);
-                return '';
+                // 💡 強化修正：將錯誤訊息丟出，讓主程式可以捕捉並顯示給使用者
+                throw e; 
             }
         }
 
         let adminRecorder;
         let adminAudioChunks = [];
         let tempBase64Audio = ''; 
+        let tempAudioMimeType = ''; // 💡 新增：紀錄錄音的正確 MIME Type
 
         async function toggleRecording(type) {
             const btn = document.getElementById(`btn-record-${type}`);
@@ -500,22 +506,31 @@
 
             if (adminRecorder && adminRecorder.state === 'recording') {
                 adminRecorder.stop();
-                // 💡 修正：移除這裡馬上關麥克風的程式，交由 onstop 處理，避免 iOS 錄音毀損
                 btn.innerText = "🎤 重新錄製";
                 btn.classList.remove('recording');
             } else {
                 try {
                     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    adminRecorder = new MediaRecorder(stream);
+                    
+                    // 💡 強化修正：自動尋找 iOS 和 Android 都支援的最佳錄音格式
+                    let options = {};
+                    if (MediaRecorder.isTypeSupported('audio/mp4')) {
+                        options = { mimeType: 'audio/mp4' };
+                    } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+                        options = { mimeType: 'audio/webm' };
+                    }
+                    
+                    adminRecorder = new MediaRecorder(stream, options);
                     adminAudioChunks = [];
                     
                     adminRecorder.ondataavailable = e => adminAudioChunks.push(e.data);
                     adminRecorder.onstop = async () => {
-                        // 💡 修正：在確定錄音資料收集完畢後，才安全關閉麥克風
                         adminRecorder.stream.getTracks().forEach(track => track.stop());
                         
-                        // 💡 修正：不強制設定為 webm，讓 iOS 自己保留 mp4 格式
-                        const blob = new Blob(adminAudioChunks);
+                        // 取得實際錄製的格式
+                        tempAudioMimeType = adminRecorder.mimeType || 'audio/mp4'; 
+                        
+                        const blob = new Blob(adminAudioChunks, { type: tempAudioMimeType });
                         tempBase64Audio = await fileToBase64(blob);
                         preview.src = tempBase64Audio;
                         preview.style.display = 'block';
@@ -528,6 +543,77 @@
                 } catch(e) {
                     showModal("麥克風存取失敗！請確認手機設定是否允許瀏覽器使用麥克風。");
                 }
+            }
+        }
+
+        // 核心流程：新增圖卡 -> 上傳圖片至 Drive -> 上傳錄音至 Drive -> 更新試算表
+        async function addNewCardWithDrive() {
+            if(GOOGLE_APP_SCRIPT_URL === '') {
+                showModal("請先在原始碼設定 GOOGLE_APP_SCRIPT_URL 才能真正上傳到雲端！");
+                return;
+            }
+
+            let cat = document.getElementById('admin-category-select').value;
+            let name = document.getElementById('new-item-name').value;
+            let imgInput = document.getElementById('new-item-image');
+            
+            if(!name) { showModal("請填寫圖卡名稱！"); return; }
+            if(!cat) { showModal("請先建立並選擇一個分類！"); return; }
+            
+            showLoader("上傳檔案至 Google Drive 中...\n(檔案較大時可能需要幾十秒，請勿關閉網頁)");
+
+            try {
+                let imgDriveUrl = '';
+                if (imgInput.files.length > 0) {
+                    let file = imgInput.files[0];
+                    let imgBase64 = await fileToBase64(file);
+                    // 確保附檔名正確
+                    let ext = file.type.split('/')[1] || 'png';
+                    imgDriveUrl = await uploadToDrive(imgBase64, `img_${Date.now()}.${ext}`, file.type);
+                }
+
+                let audioDriveUrl = '';
+                if (tempBase64Audio !== '') {
+                    // 💡 強化修正：使用真實錄製的 mimeType 上傳，並給予正確附檔名
+                    let ext = tempAudioMimeType.includes('mp4') ? 'mp4' : 'webm';
+                    audioDriveUrl = await uploadToDrive(tempBase64Audio, `audio_${Date.now()}.${ext}`, tempAudioMimeType);
+                }
+
+                let newItem = {
+                    id: 'item_' + Date.now(),
+                    name: name,
+                    emoji: name.charAt(0),
+                    image: imgDriveUrl,
+                    audio: audioDriveUrl
+                };
+
+                // 確保該分類存在
+                if (!appData.cards[cat]) {
+                    appData.cards[cat] = { label: cat, items: [] };
+                }
+                
+                appData.cards[cat].items.push(newItem);
+                
+                showLoader("更新資料庫中...");
+                await saveData();
+                
+                // 清空表單
+                document.getElementById('new-item-name').value = '';
+                document.getElementById('new-item-image').value = '';
+                document.getElementById('audio-preview-new').style.display = 'none';
+                document.getElementById('btn-record-new').innerText = "🎤 點擊開始錄音";
+                tempBase64Audio = '';
+                tempAudioMimeType = '';
+                
+                renderAdminItemList();
+                hideLoader();
+                showModal("圖卡新增成功！");
+
+            } catch (e) {
+                hideLoader();
+                // 💡 強化修正：印出詳細的錯誤訊息
+                showModal("上傳發生錯誤！\n" + e.message);
+                console.error("Upload Error:", e);
             }
         }
 
